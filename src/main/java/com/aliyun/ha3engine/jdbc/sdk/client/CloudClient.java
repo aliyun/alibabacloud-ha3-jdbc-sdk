@@ -1,16 +1,17 @@
 package com.aliyun.ha3engine.jdbc.sdk.client;
 
 import java.sql.SQLException;
+import java.util.List;
+import java.util.Map;
 
 import com.aliyun.ha3engine.Client;
 import com.aliyun.ha3engine.jdbc.common.config.Ha3Config;
+import com.aliyun.ha3engine.jdbc.common.exception.ErrorCode;
+import com.aliyun.ha3engine.jdbc.common.exception.Ha3DriverException;
 import com.aliyun.ha3engine.jdbc.common.utils.FileTools;
 import com.aliyun.ha3engine.jdbc.common.utils.Ha3ToolUtils;
 import com.aliyun.ha3engine.jdbc.common.utils.JsonUtils;
-import com.aliyun.ha3engine.models.Config;
-import com.aliyun.ha3engine.models.SearchQuery;
-import com.aliyun.ha3engine.models.SearchRequestModel;
-import com.aliyun.ha3engine.models.SearchResponseModel;
+import com.aliyun.ha3engine.models.*;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import org.slf4j.Logger;
@@ -121,4 +122,25 @@ public class CloudClient {
         }
         return resultJsonObject.toString();
     }
+
+    /**
+     * 通过sql-client发起请求，将数据写入Ha3 Server，返回更新的行数
+     *
+     * @param body
+     * @return
+     */
+    public void insertOrUpdate(String table, String primaryKey, List<Map<String, ?>> body) throws Ha3DriverException {
+        if (ha3Config.isLocalMode()) {
+            return;
+        }
+        try {
+            PushDocumentsRequestModel request = new PushDocumentsRequestModel();
+            request.setBody(body);
+            client.pushDocuments(table, primaryKey, request);
+        } catch (Exception e) {
+            logger.error("Failed to insert data:" + e.getMessage(), e);
+            throw new Ha3DriverException(ErrorCode.INSERT_FAIL, "call ha3 engine error, push fail. " + e.getMessage());
+        }
+    }
+
 }

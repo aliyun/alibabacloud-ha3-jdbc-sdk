@@ -23,15 +23,21 @@ import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Calendar;
-import java.util.List;
-import java.util.Locale;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import com.alibaba.druid.DbType;
+import com.alibaba.druid.sql.SQLUtils;
+import com.alibaba.druid.sql.ast.SQLExpr;
+import com.alibaba.druid.sql.ast.SQLStatement;
+import com.alibaba.druid.sql.ast.expr.*;
+import com.alibaba.druid.sql.ast.statement.SQLInsertStatement;
+import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlDeleteStatement;
+import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlInsertStatement;
 import com.alibaba.druid.sql.visitor.ParameterizedOutputVisitorUtils;
+import com.alibaba.druid.stat.TableStat;
 import com.alibaba.druid.util.JdbcConstants;
 import com.aliyun.ha3engine.jdbc.common.config.Ha3KvPairBuilder;
 import com.aliyun.ha3engine.jdbc.common.exception.ErrorCode;
@@ -78,6 +84,8 @@ public class Ha3PreparedStatement extends Ha3Statement implements PreparedStatem
                     ha3Connection.setSchema(fromIndex);
                     break;
                 }
+            } else if (firstStmtChar == 'I' || firstStmtChar == 'D') {
+                break;
             } else {
                 throw new SQLException(
                     "Provided query type '" + firstStmtChar + "' is not supported!");
@@ -94,7 +102,9 @@ public class Ha3PreparedStatement extends Ha3Statement implements PreparedStatem
         if (firstStmtChar == 'S') {
             this.execute(preparedSql);
             return ha3ResultSet;
-        } else {
+        } else if (firstStmtChar == 'I' || firstStmtChar == 'D') {
+            throw new SQLException("Please use executeUpdate!");
+        }  else {
             throw new SQLException(
                 "Provided query type '" + preparedSql.substring(0, preparedSql.indexOf(' ')) + "' is not supported!");
         }
@@ -102,7 +112,186 @@ public class Ha3PreparedStatement extends Ha3Statement implements PreparedStatem
 
     @Override
     public int executeUpdate() throws SQLException {
-        throw new SQLFeatureNotSupportedException("Ha3 Cloud client not support update!");
+        if (firstStmtChar == 'I') {
+            return executeHa3Update(preparedSql);
+        } else if (firstStmtChar == 'D') {
+            return executeHa3Delete(preparedSql);
+        } else {
+            throw new SQLException(
+                    "Provided query type '" + preparedSql.substring(0, preparedSql.indexOf(' ')) + "' is not supported!");
+        }
+    }
+
+    /**
+     * 发起远端调用，请求Ha3 Server写入数据
+     *
+     * @param sql
+     * @throws SQLException
+     */
+    protected int executeHa3Update(String sql) throws Ha3DriverException {
+        List<Map<String, ?>> body = getBodyFromInsertSql(sql);
+        String tableName = getTableNameFromSql(sql);
+        String pk = getPk(sql);
+        cloudClient.insertOrUpdate(tableName, pk, body);
+        return body.size();
+    }
+
+    /**
+     * 发起远端调用，请求Ha3 Server删除数据
+     *
+     * @param sql
+     * @throws SQLException
+     */
+    protected int executeHa3Delete(String sql) throws Ha3DriverException {
+        List<Map<String, ?>> body = getBodyFromDeleteSql(sql);
+        String tableName = getTableNameFromSql(sql);
+        String pk = getPkFromSql(sql);
+        cloudClient.insertOrUpdate(tableName, pk, body);
+        return body.size();
+    }
+
+
+    /**
+     * 获取pk信息，优先从param里获取，如果param里没有，默认取insert sql语句的第一个字段
+     * @return
+     */
+    private String getPk(String sql) throws Ha3DriverException {
+        // 优先从param里取pk字段
+        if (sqlAndParams.length > 0) {
+            Map<String, String> param = (Map<String, String>) sqlAndParams[0];
+            if (null != param && param.containsKey("pk")) {
+                return param.get("pk");
+            }
+        }
+        return getPkFromSql(sql);
+    }
+
+    /**
+     * 从insert sql语句中解析推送请求的body
+     * @param sql
+     * @return
+     */
+    private java.util.List<java.util.Map<String, ?>> getBodyFromInsertSql(String sql) throws Ha3DriverException {
+        List<Map<String, ?>> body = new ArrayList<>();
+
+        int paramIndex = 1;
+
+        SQLStatement statement = SQLUtils.parseSingleMysqlStatement(sql);
+
+        // 获取列名
+        Collection<TableStat.Column> columns = getColumnsFromSql(sql);
+        List<String> columnNames = columns.stream().map(e -> e.getName()).collect(Collectors.toList());
+
+        // 解析value记录
+        List<SQLInsertStatement.ValuesClause> valuesList = ((MySqlInsertStatement) statement).getValuesList();
+
+        for (SQLInsertStatement.ValuesClause valuesClause : valuesList) {
+            java.util.Map<String, Object> record = new HashMap<>();
+            record.put("cmd", "add");
+
+            List<SQLExpr> exprList = valuesClause.getValues();
+            if (exprList.size() != columnNames.size()) {
+                throw new Ha3DriverException(ErrorCode.INVALID_PARAM, "values size not match column size!");
+            }
+            Map<String, Object> fields= new HashMap<>();
+            Object value;
+            for (int i=0; i<exprList.size(); i++) {
+                SQLExpr expr = exprList.get(i);
+                if (expr instanceof SQLNullExpr) {
+                    value = null;
+                }
+                else if (expr instanceof SQLValuableExpr) {
+                    value = ((SQLValuableExpr) expr).getValue();
+                } else if (expr instanceof SQLVariantRefExpr) {
+                    // 从param里取值
+                    value = sqlAndParams[paramIndex++];
+                } else {
+                    throw new Ha3DriverException(ErrorCode.INVALID_PARAM, "unsupported expr type: " + expr.getClass().getName());
+                }
+                fields.put(columnNames.get(i), value);
+            }
+            record.put("fields", fields);
+            body.add(record);
+        }
+        return body;
+    }
+
+
+    /**
+     * 从delete sql语句中解析推送请求的body
+     * @param sql
+     * @return
+     */
+    private List<Map<String, ?>> getBodyFromDeleteSql(String sql) throws Ha3DriverException {
+        SQLStatement statement = SQLUtils.parseSingleMysqlStatement(sql);
+        int paramIndex = 1;
+
+        // 获取列名
+        Collection<TableStat.Column> columns = getColumnsFromSql(sql);
+        if (columns.size() != 1) {
+            throw new Ha3DriverException(ErrorCode.INVALID_PARAM, "column error, only support delete data by primary key.");
+        }
+        List<String> columnNames = columns.stream().map(e -> e.getName()).collect(Collectors.toList());
+        String columnName = columnNames.get(0);
+
+        List<Map<String, ?>> body = new ArrayList<>();
+
+        // 解析value记录
+        SQLExpr where = ((MySqlDeleteStatement) statement).getWhere();
+
+        // String sql = " delete from  user where  id  = 1";
+        if (where instanceof SQLBinaryOpExpr) {
+            if (((SQLBinaryOpExpr) where).getOperator() != SQLBinaryOperator.Equality) {
+                throw new Ha3DriverException(ErrorCode.INVALID_PARAM, "unsupported where type: " + ((SQLBinaryOpExpr) where).getOperator());
+            }
+            SQLExpr left = ((SQLBinaryOpExpr) where).getLeft();
+            if (!(left instanceof SQLIdentifierExpr)) {
+                throw new Ha3DriverException(ErrorCode.INVALID_PARAM, "column should in front of value.");
+            }
+            SQLExpr right = ((SQLBinaryOpExpr) where).getRight();
+
+            java.util.Map<String, Object> record = new HashMap<>();
+            record.put("cmd", "delete");
+            Map<String, Object> fields= new HashMap<>();
+            Object value;
+
+            if (right instanceof SQLValuableExpr) {
+                value = ((SQLValuableExpr) right).getValue();
+            } else if (right instanceof SQLVariantRefExpr) {
+                value = sqlAndParams[paramIndex++];
+            } else {
+                throw new IllegalArgumentException("not support type");
+            }
+            fields.put(columnName, value);
+            record.put("fields", fields);
+            body.add(record);
+        } else if (where instanceof SQLInListExpr) {
+            // String sql = " delete from  user where id  in (1,2,3,?,5)";
+            if (((SQLInListExpr) where).isNot()) {
+                throw new IllegalArgumentException("only support in, not support not in");
+            }
+            List<SQLExpr> exprs = ((SQLInListExpr) where).getTargetList();
+            for (SQLExpr expr : exprs) {
+                java.util.Map<String, Object> record = new HashMap<>();
+                record.put("cmd", "delete");
+                Map<String, Object> fields= new HashMap<>();
+                Object value;
+
+                if (expr instanceof SQLValuableExpr) {
+                    value = ((SQLValuableExpr) expr).getValue();
+                } else if (expr instanceof SQLVariantRefExpr) {
+                    value = sqlAndParams[paramIndex++];
+                } else {
+                    throw new IllegalArgumentException("unsupported expr type: " + expr.getClass().getName());
+                }
+                fields.put(columnName, value);
+                record.put("fields", fields);
+                body.add(record);
+            }
+        } else {
+            throw new IllegalArgumentException("unsupported where type");
+        }
+        return body;
     }
 
     private StringBuilder getSql(String sql) throws Ha3DriverException {
@@ -459,8 +648,16 @@ public class Ha3PreparedStatement extends Ha3Statement implements PreparedStatem
 
     @Override
     public boolean execute(String sql) throws SQLException {
-        initResultSet(sql);
-        return true;
+        char firstStmtCharFromSql = getFirstStmtCharFromSql(sql);
+        if (firstStmtCharFromSql == 'S') {
+            initResultSet(sql);
+            return true;
+        } else if (firstStmtCharFromSql == 'I' || firstStmtCharFromSql == 'U') {
+            throw new SQLException("Please use executeUpdate!");
+        } else {
+            throw new SQLException(
+                    "Provided query type '" + firstStmtCharFromSql + "' is not supported!");
+        }
     }
 
     /**

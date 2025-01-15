@@ -6,7 +6,7 @@
 
     <groupId>com.aliyun</groupId>
     <artifactId>aliyun-sdk-ha3engine-jdbc</artifactId>
-    <version>0.0.1</version>
+    <version>0.0.2</version>
 
     <name>aliyun-sdk-ha3engine-jdbc</name>
     <description>Alibaba Cloud Ha3engine JDBC SDK
